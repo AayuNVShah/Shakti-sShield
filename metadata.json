@@ -1,0 +1,10 @@
+{
+  "name": "Scam Call Shield",
+  "description": "Real-time Indian phone scam detection in Hindi and Gujarati powered by incremental Gemini audio analysis.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
