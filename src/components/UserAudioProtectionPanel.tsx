@@ -17,6 +17,8 @@ import {
   FileText,
   Headphones,
   Check,
+  Send,
+  Edit3,
 } from 'lucide-react';
 import { Language, OutgoingInterceptionEvent, SensitiveType, UserAudioAnalysisResponse } from '../types';
 import { getAudioContext, sliceAudioBufferToWav, fetchAndDecodeAudio } from '../utils/audioChunker';
@@ -42,12 +44,13 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
   // Real-time live transcription state
   const [liveInterimTranscript, setLiveInterimTranscript] = useState<string>('');
   const [confirmedTranscriptHistory, setConfirmedTranscriptHistory] = useState<string[]>([]);
+  const [customTextInput, setCustomTextInput] = useState<string>('');
 
   // Bleeped audio player state
   const [bleepedAudioUrl, setBleepedAudioUrl] = useState<string | null>(null);
   const [isPlayingDubbed, setIsPlayingDubbed] = useState<boolean>(false);
   const [bleepAudioProgress, setBleepAudioProgress] = useState<number>(0);
-  const [bleepAudioDuration, setBleepAudioDuration] = useState<number>(2.9);
+  const [bleepAudioDuration, setBleepAudioDuration] = useState<number>(2.8);
   const [activeMaskedText, setActiveMaskedText] = useState<string>(
     'हाँ सर, मेरा ओटीपी नंबर •••••• [1000Hz CENSOR BLEEP] है।'
   );
@@ -66,6 +69,7 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
   const userChunkIndexRef = useRef<number>(0);
   const dubbedAudioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const speechRecognizerRef = useRef<any>(null);
+  const debounceTimerRef = useRef<any>(null);
 
   // Visualizer analyser
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -76,9 +80,7 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
     let isCurrent = true;
     async function initSampleBleep() {
       try {
-        // Fetch pre-recorded victim speech: "हाँ सर, मेरा ओटीपी नंबर 582910 है।"
         const buffer = await fetchAndDecodeAudio('/demo-audio/victim_otp_leak_hi.wav');
-        // Bleep the exact digit window from 1.25s to 2.75s
         const { dubbedAudioUrl } = await dubSensitiveAudio(buffer, 1.25, 2.75);
 
         if (isCurrent) {
@@ -96,6 +98,78 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
       isCurrent = false;
     };
   }, []);
+
+  // Core function to dub and bleep any live transcription text immediately
+  const dubLiveTranscription = useCallback(
+    async (text: string) => {
+      if (!text || !text.trim()) return;
+      setIsProcessing(true);
+      setOriginalSpokenText(text);
+
+      const hasSecrets = Boolean(
+        /\d{2,8}|[०-९]{2,8}|[૦-૯]{2,8}|otp|pin|password|पासवर्ड|પિન|ઓટીપી/i.test(text)
+      );
+
+      const masked = maskSensitiveTranscript(text, []);
+      setActiveMaskedText(hasSecrets ? masked : text);
+
+      try {
+        const res = await fetch('/api/dub-transcript-audio', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            language,
+          }),
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          if (data.audioBase64) {
+            const binary = atob(data.audioBase64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              bytes[i] = binary.charCodeAt(i);
+            }
+            const blob = new Blob([bytes], { type: 'audio/wav' });
+            const newUrl = URL.createObjectURL(blob);
+
+            // Clean previous audio instance
+            if (dubbedAudioPlayerRef.current) {
+              dubbedAudioPlayerRef.current.pause();
+              dubbedAudioPlayerRef.current = null;
+            }
+            setBleepedAudioUrl(newUrl);
+            setBleepAudioProgress(0);
+
+            if (hasSecrets) {
+              const event: OutgoingInterceptionEvent = {
+                id: `live_interception_${Date.now()}`,
+                timestamp: new Date().toLocaleTimeString(),
+                chunkIndex: userChunkIndexRef.current++,
+                sensitiveType: 'OTP',
+                maskedTranscript: masked,
+                rawExcerpt: text,
+                isDubbed: true,
+                dubbedAudioUrl: newUrl,
+                safetyAlert:
+                  language === 'gu'
+                    ? 'સુરક્ષા ચેતવણી: તમારા દ્વારા બોલાયેલ ઓટીપી/પિન સેન્સર કરીને ડબ કરી દેવાયો છે!'
+                    : 'सुरक्षा चेतावनी: आपके द्वारा बोला गया गोपनीय कोड तत्काल सेंसर/डब कर दिया गया है!',
+              };
+              setLatestInterception(event);
+              onInterceptionOccurred(event);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Failed to dub live transcription:', err);
+      } finally {
+        setIsProcessing(false);
+      }
+    },
+    [language, onInterceptionOccurred]
+  );
 
   // Stop mic & speech recognizer
   const stopMicrophone = useCallback(() => {
@@ -174,17 +248,26 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
 
           recognizer.onresult = (event: any) => {
             let interim = '';
+            let latestFullText = '';
             for (let i = event.resultIndex; i < event.results.length; ++i) {
               const transcriptChunk = event.results[i][0].transcript;
+              latestFullText = transcriptChunk;
               if (event.results[i].isFinal) {
                 setConfirmedTranscriptHistory((prev) => [...prev.slice(-3), transcriptChunk]);
                 setLiveInterimTranscript('');
+                // Automatically dub and bleep this finalized speech into the player!
+                dubLiveTranscription(transcriptChunk);
               } else {
                 interim += transcriptChunk;
               }
             }
             if (interim) {
               setLiveInterimTranscript(interim);
+              // Debounce dubbing while user is in middle of speaking
+              if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+              debounceTimerRef.current = setTimeout(() => {
+                dubLiveTranscription(interim);
+              }, 700);
             }
           };
 
@@ -207,7 +290,7 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
         }
       }
 
-      // Fast MediaRecorder setup (2.0s slices for high responsiveness)
+      // Fast MediaRecorder setup
       const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
       recorderRef.current = recorder;
       audioChunksRef.current = [];
@@ -286,7 +369,6 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
       }
 
       if (dlpData.contains_sensitive_info && protectionEnabled) {
-        // DUB the sensitive audio: user's voice remains, OTP numbers replaced with 1000Hz bleep tone!
         const { dubbedAudioUrl } = await dubSensitiveAudio(
           audioBuffer,
           dlpData.redaction_start_sec || 0.4,
@@ -297,6 +379,15 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
           dlpData.transcript,
           dlpData.sensitive_excerpts
         );
+
+        if (dubbedAudioPlayerRef.current) {
+          dubbedAudioPlayerRef.current.pause();
+          dubbedAudioPlayerRef.current = null;
+        }
+
+        setBleepedAudioUrl(dubbedAudioUrl);
+        setBleepAudioDuration(audioBuffer.duration);
+        setActiveMaskedText(masked);
 
         const event: OutgoingInterceptionEvent = {
           id: `interception_${Date.now()}`,
@@ -312,24 +403,8 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
               ? dlpData.safety_alert_gu
               : dlpData.safety_alert_hi,
         };
-
-        setBleepedAudioUrl(dubbedAudioUrl);
-        setBleepAudioDuration(audioBuffer.duration);
-        setActiveMaskedText(masked);
         setLatestInterception(event);
         onInterceptionOccurred(event);
-      } else if (dlpData.transcript && dlpData.transcript.trim()) {
-        const event: OutgoingInterceptionEvent = {
-          id: `speech_${Date.now()}`,
-          timestamp: new Date().toLocaleTimeString(),
-          chunkIndex: chunkIdx,
-          sensitiveType: 'NONE',
-          maskedTranscript: dlpData.transcript,
-          rawExcerpt: '',
-          isDubbed: false,
-          safetyAlert: 'Normal user speech: No credentials disclosed.',
-        };
-        setLatestInterception(event);
       }
     } catch (e: any) {
       console.warn('User audio slice processing note:', e);
@@ -343,72 +418,21 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
     setIsProcessing(true);
     setLiveInterimTranscript(textToSimulate);
     setOriginalSpokenText(textToSimulate);
-    const chunkIdx = userChunkIndexRef.current++;
 
-    try {
-      let buffer: AudioBuffer;
-      let bleepStart = 1.25;
-      let bleepEnd = 2.75;
-
-      if (type === 'OTP') {
-        // Load authentic Hindi speech: "हाँ सर, मेरा ओटीपी नंबर 582910 है।"
-        buffer = await fetchAndDecodeAudio('/demo-audio/victim_otp_leak_hi.wav');
-        bleepStart = 1.25;
-        bleepEnd = 2.75;
-      } else if (type === 'BANK_PIN') {
-        // Load authentic Gujarati speech: "હા સાહેબ, મારો એટીએમ પિન 4719 છે।"
-        buffer = await fetchAndDecodeAudio('/demo-audio/victim_pin_leak_gu.wav');
-        bleepStart = 1.35;
-        bleepEnd = 2.65;
-      } else {
-        // Normal speech
-        buffer = await fetchAndDecodeAudio('/demo-audio/victim_otp_leak_hi.wav');
-        bleepStart = 0;
-        bleepEnd = 0; // No bleeping
-      }
-
-      // Dub with 1000Hz bleep tone over the exact digits
-      const { dubbedAudioUrl } = await dubSensitiveAudio(
-        buffer,
-        type !== 'NONE' ? bleepStart : 0,
-        type !== 'NONE' ? bleepEnd : 0
-      );
-
-      const masked = maskSensitiveTranscript(textToSimulate, [sensitiveExcerpt]);
-
-      const event: OutgoingInterceptionEvent = {
-        id: `sim_${Date.now()}`,
-        timestamp: new Date().toLocaleTimeString(),
-        chunkIndex: chunkIdx,
-        sensitiveType: type,
-        maskedTranscript: masked,
-        rawExcerpt: sensitiveExcerpt,
-        isDubbed: type !== 'NONE',
-        dubbedAudioUrl: type !== 'NONE' ? dubbedAudioUrl : undefined,
-        safetyAlert:
-          type !== 'NONE'
-            ? language === 'gu'
-              ? `સુરક્ષા ચેતવણી: તમારા બોલાયેલ ${type} વિગતો સેન્સર/ડબ કરી દેવાઈ છે!`
-              : `सुरक्षा चेतावनी: आपके द्वारा बोला गया ${type} तत्काल सेंसर/डब कर दिया गया है!`
-            : 'सामान्य बातचीत: कोई संवेदनशील डेटा नहीं।',
-      };
-
-      setBleepedAudioUrl(dubbedAudioUrl);
-      setBleepAudioDuration(buffer.duration);
-      setActiveMaskedText(masked);
-      setConfirmedTranscriptHistory((prev) => [...prev.slice(-3), textToSimulate]);
-      setLatestInterception(event);
-      if (type !== 'NONE') {
-        onInterceptionOccurred(event);
-      }
-    } catch (err) {
-      console.error('Simulation error:', err);
-    } finally {
-      setIsProcessing(false);
-    }
+    // Immediately dub this simulated speech text into the player
+    await dubLiveTranscription(textToSimulate);
   };
 
-  // Toggle play/pause for bleeped audio player
+  // Handle custom manual text input & bleeping
+  const handleCustomTextSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!customTextInput.trim()) return;
+    setLiveInterimTranscript(customTextInput);
+    dubLiveTranscription(customTextInput);
+    setCustomTextInput('');
+  };
+
+  // Toggle play/pause for bleeped audio player (fresh Audio instantiation)
   const togglePlayBleeped = () => {
     if (!bleepedAudioUrl) return;
 
@@ -420,29 +444,38 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
       return;
     }
 
-    if (!dubbedAudioPlayerRef.current || dubbedAudioPlayerRef.current.src !== bleepedAudioUrl) {
-      const audio = new Audio(bleepedAudioUrl);
-      dubbedAudioPlayerRef.current = audio;
-
-      audio.ontimeupdate = () => {
-        if (audio.duration > 0) {
-          setBleepAudioProgress((audio.currentTime / audio.duration) * 100);
-        }
-      };
-
-      audio.onended = () => {
-        setIsPlayingDubbed(false);
-        setBleepAudioProgress(0);
-      };
-
-      audio.onerror = () => {
-        setIsPlayingDubbed(false);
-        setBleepAudioProgress(0);
-      };
+    // Stop any previous instance
+    if (dubbedAudioPlayerRef.current) {
+      dubbedAudioPlayerRef.current.pause();
+      dubbedAudioPlayerRef.current = null;
     }
 
-    dubbedAudioPlayerRef.current.currentTime = 0;
-    dubbedAudioPlayerRef.current.play();
+    const audio = new Audio(bleepedAudioUrl);
+    dubbedAudioPlayerRef.current = audio;
+
+    audio.onloadedmetadata = () => {
+      if (audio.duration && !isNaN(audio.duration) && audio.duration > 0) {
+        setBleepAudioDuration(audio.duration);
+      }
+    };
+
+    audio.ontimeupdate = () => {
+      if (audio.duration > 0) {
+        setBleepAudioProgress((audio.currentTime / audio.duration) * 100);
+      }
+    };
+
+    audio.onended = () => {
+      setIsPlayingDubbed(false);
+      setBleepAudioProgress(0);
+    };
+
+    audio.onerror = () => {
+      setIsPlayingDubbed(false);
+      setBleepAudioProgress(0);
+    };
+
+    audio.play();
     setIsPlayingDubbed(true);
   };
 
@@ -557,7 +590,7 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
       )}
 
       {/* 1. Real-Time Live Speech Transcription Box */}
-      <div className="rounded-xl bg-slate-950/90 border border-slate-800/80 p-3.5 space-y-2">
+      <div className="rounded-xl bg-slate-950/90 border border-slate-800/80 p-3.5 space-y-2.5">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
             <FileText className="h-3.5 w-3.5 text-indigo-400" />
@@ -566,11 +599,12 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
           {isMicActive && (
             <span className="text-[10px] font-mono text-emerald-400 flex items-center gap-1">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              Live Stream
+              Live Microphone Stream
             </span>
           )}
         </div>
 
+        {/* Live speech transcription display */}
         <div className="min-h-[52px] rounded-lg bg-slate-900/80 p-3 border border-slate-800 flex flex-col justify-center text-xs sm:text-sm">
           {liveInterimTranscript ? (
             <div className="text-white font-medium flex items-center gap-2">
@@ -588,10 +622,31 @@ export const UserAudioProtectionPanel: React.FC<UserAudioProtectionPanelProps> =
             <span className="text-slate-500 text-xs italic">
               {isMicActive
                 ? 'Speak now in Hindi or Gujarati... your speech will transcribe here in real time.'
-                : 'Microphone is idle. Click "Enable Microphone" or test with simulation presets below.'}
+                : 'Microphone is idle. Click "Enable Microphone" or enter custom speech below.'}
             </span>
           )}
         </div>
+
+        {/* Custom text input to test any exact spoken phrase */}
+        <form onSubmit={handleCustomTextSubmit} className="flex gap-2 pt-1">
+          <div className="relative flex-1">
+            <input
+              type="text"
+              value={customTextInput}
+              onChange={(e) => setCustomTextInput(e.target.value)}
+              placeholder="Or type/paste custom speech to bleep (e.g. मेरा OTP 482910 है)"
+              className="w-full rounded-xl bg-slate-900 border border-slate-700 px-3.5 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 font-sans"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={!customTextInput.trim() || isProcessing}
+            className="flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 px-3.5 py-2 text-xs font-bold text-white transition-all cursor-pointer shrink-0"
+          >
+            <Send className="h-3 w-3" />
+            <span>Censor & Bleep</span>
+          </button>
+        </form>
       </div>
 
       {/* 2. DEDICATED SPACE: Censored & Bleeped Audio Audition Player */}

@@ -413,6 +413,80 @@ INSTRUCTIONS:
   }
 });
 
+// -------------------------------------------------------------
+// 3. Dynamic Speech Dubbing: Synthesizes text & bleeps sensitive portions
+// -------------------------------------------------------------
+app.post('/api/dub-transcript-audio', async (req, res) => {
+  const { text, sensitiveExcerpt, language = 'hi' } = req.body;
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({ error: 'Missing text to dub' });
+  }
+
+  if (!apiKey) {
+    return res.status(503).json({ error: 'GEMINI_API_KEY not configured' });
+  }
+
+  try {
+    const voiceName = language === 'gu' ? 'Puck' : 'Kore';
+
+    const ttsResponse = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [{ role: 'user', parts: [{ text }] }],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName },
+          },
+        },
+      },
+    });
+
+    const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Audio) {
+      throw new Error('TTS did not return audio data');
+    }
+
+    const wavBuffer = Buffer.from(base64Audio, 'base64');
+    const hasSensitive = Boolean(
+      sensitiveExcerpt ||
+      /\d{2,8}|[०-९]{2,8}|[૦-૯]{2,8}|otp|pin|password|पासवर्ड|પિન|ઓટીપી/i.test(text)
+    );
+
+    let outputBuffer = wavBuffer;
+    if (hasSensitive && wavBuffer.length > 44) {
+      const header = wavBuffer.subarray(0, 44);
+      const data = wavBuffer.subarray(44);
+      const samples = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
+
+      const totalSamples = samples.length;
+      const bleepStart = Math.floor(totalSamples * 0.35);
+      const bleepEnd = Math.floor(totalSamples * 0.78);
+      const sampleRate = 24000;
+      const bleepFreq = 1000;
+
+      for (let i = bleepStart; i < bleepEnd; i++) {
+        const t = (i - bleepStart) / sampleRate;
+        const tone = Math.sin(2 * Math.PI * bleepFreq * t) * 0.45;
+        samples[i] = Math.floor(tone * 32767);
+      }
+
+      outputBuffer = Buffer.alloc(44 + samples.byteLength);
+      header.copy(outputBuffer, 0);
+      Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength).copy(outputBuffer, 44);
+    }
+
+    return res.json({
+      audioBase64: outputBuffer.toString('base64'),
+      mimeType: 'audio/wav',
+      hasBleep: hasSensitive,
+    });
+  } catch (err: any) {
+    console.error('Error in dub-transcript-audio:', err);
+    return res.status(500).json({ error: err.message || 'Failed to dub transcript audio' });
+  }
+});
+
 // Vite middleware in dev or static files in production
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

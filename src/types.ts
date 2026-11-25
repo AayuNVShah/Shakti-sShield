@@ -81,19 +81,6 @@ export interface SessionEvidenceSummary {
   recommendedAction?: string;
 }
 
-export interface DemoTestResult {
-  scenarioId: string;
-  title: string;
-  expected: 'scam' | 'genuine';
-  detectedStatus: MonitoringStatus;
-  passed: boolean;
-  alertTriggeredBeforeEnd: boolean;
-  alertLatencySec: number | null;
-  detectedFlags: RedFlag[];
-  durationSec: number;
-  evidenceSample: string;
-}
-
 // User Spoken Audio & Data Leak Interceptor Types
 export type SensitiveType =
   | 'OTP'
@@ -128,4 +115,53 @@ export interface OutgoingInterceptionEvent {
   isDubbed: boolean;
   dubbedAudioUrl?: string;
   safetyAlert: string;
+}
+
+// Comprehensive Test & Reliability Types
+export type TestCaseCategory =
+  | 'CALLER_SCAM_DETECTION'
+  | 'OUTBOUND_DLP_CENSOR'
+  | 'POLICY_SAFETY_RULES'
+  | 'INJECTION_RESISTANCE';
+
+export interface ComprehensiveTestCase {
+  id: string;
+  name: string;
+  category: TestCaseCategory;
+  categoryLabel: string;
+  description: string;
+  targetInput: string;
+  expectedOutcome: string;
+}
+
+export interface TestCaseExecutionResult {
+  testId: string;
+  name: string;
+  category: TestCaseCategory;
+  passed: boolean;
+  status?: 'PASSED' | 'FAILED';
+  durationMs: number;
+  latencyMs?: number;
+  assertionsCount: number;
+  assertionsPassed: number;
+  details: string;
+  actualOutcome?: string;
+  assertionDetails?: string;
+  latencySec?: number | null;
+  alertBeforeEnd?: boolean;
+  detectedFlags?: string[];
+  evidence?: string;
+}
+
+export interface DemoTestResult {
+  scenarioId: string;
+  title: string;
+  expected: 'scam' | 'genuine';
+  detectedStatus: MonitoringStatus;
+  passed: boolean;
+  alertTriggeredBeforeEnd: boolean;
+  alertLatencySec: number | null;
+  detectedFlags: RedFlag[];
+  durationSec: number;
+  evidenceSample: string;
 }
